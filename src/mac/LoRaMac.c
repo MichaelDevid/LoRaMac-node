@@ -368,6 +368,22 @@ static ChannelParams_t Channels[LORA_MAX_NB_CHANNELS];
  * Contains the channels which remain to be applied.
  */
 static uint16_t ChannelsMaskRemaining[6];
+
+/*!
+ * Defines the first channel for RX window 2 for US band
+ */
+#define LORAMAC_FIRST_RX2_CHANNEL           ( (uint32_t) 923.3e6 )
+
+/*!
+ * Defines the last channel for RX window 2 for US band
+ */
+#define LORAMAC_LAST_RX2_CHANNEL            ( (uint32_t) 927.5e6 )
+
+/*!
+ * Defines the step width of the channels for RX window 2
+ */
+#define LORAMAC_STEPWIDTH_RX2_CHANNEL       ( (uint32_t) 600e3 )
+
 #else
     #error "Please define a frequency band in the compiler options."
 #endif
@@ -647,6 +663,15 @@ static void SetPublicNetwork( bool enable );
  * \param [IN] timeout window channel timeout
  */
 static void RxWindowSetup( uint32_t freq, int8_t datarate, uint32_t bandwidth, uint16_t timeout, bool rxContinuous );
+
+/*!
+ * \brief Verifies if the RX window 2 frequency is in range
+ *
+ * \param [IN] freq window channel frequency
+ *
+ * \retval status  Function status [1: OK, 0: Frequency not applicable]
+ */
+static bool Rx2FreqInRange( uint32_t freq );
 
 /*!
  * \brief Adds a new MAC command to be sent.
@@ -1225,11 +1250,6 @@ static void OnRadioRxDone( uint8_t *payload, uint16_t size, int16_t rssi, int8_t
                         }
                     }
 
-                    if( fCtrl.Bits.FOptsLen > 0 )
-                    {
-                        // Decode Options field MAC commands
-                        ProcessMacCommands( payload, 8, appPayloadStartIndex, snr );
-                    }
                     if( ( ( size - 4 ) - appPayloadStartIndex ) > 0 )
                     {
                         port = payload[appPayloadStartIndex++];
@@ -1239,19 +1259,32 @@ static void OnRadioRxDone( uint8_t *payload, uint16_t size, int16_t rssi, int8_t
 
                         if( port == 0 )
                         {
-                            LoRaMacPayloadDecrypt( payload + appPayloadStartIndex,
-                                                   frameLen,
-                                                   nwkSKey,
-                                                   address,
-                                                   DOWN_LINK,
-                                                   downLinkCounter,
-                                                   LoRaMacRxPayload );
+                            if( fCtrl.Bits.FOptsLen == 0 )
+                            {
+                                LoRaMacPayloadDecrypt( payload + appPayloadStartIndex,
+                                                       frameLen,
+                                                       nwkSKey,
+                                                       address,
+                                                       DOWN_LINK,
+                                                       downLinkCounter,
+                                                       LoRaMacRxPayload );
 
-                            // Decode frame payload MAC commands
-                            ProcessMacCommands( LoRaMacRxPayload, 0, frameLen, snr );
+                                // Decode frame payload MAC commands
+                                ProcessMacCommands( LoRaMacRxPayload, 0, frameLen, snr );
+                            }
+                            else
+                            {
+                                skipIndication = true;
+                            }
                         }
                         else
                         {
+                            if( fCtrl.Bits.FOptsLen > 0 )
+                            {
+                                // Decode Options field MAC commands
+                                ProcessMacCommands( payload, 8, appPayloadStartIndex, snr );
+                            }
+
                             LoRaMacPayloadDecrypt( payload + appPayloadStartIndex,
                                                    frameLen,
                                                    appSKey,
@@ -1637,7 +1670,7 @@ static void OnRxWindow1TimerEvent( void )
     {// LoRa 500 kHz
         bandwidth  = 2;
     }
-    RxWindowSetup( 923.3e6 + ( Channel % 8 ) * 600e3, datarate, bandwidth, symbTimeout, false );
+    RxWindowSetup( LORAMAC_FIRST_RX2_CHANNEL + ( Channel % 8 ) * LORAMAC_STEPWIDTH_RX2_CHANNEL, datarate, bandwidth, symbTimeout, false );
 #else
     #error "Please define a frequency band in the compiler options."
 #endif
@@ -1919,6 +1952,22 @@ static void RxWindowSetup( uint32_t freq, int8_t datarate, uint32_t bandwidth, u
     }
 }
 
+static bool Rx2FreqInRange( uint32_t freq )
+{
+#if defined( USE_BAND_433 ) || defined( USE_BAND_780 ) || defined( USE_BAND_868 )
+    if( Radio.CheckRfFrequency( freq ) == true )
+#elif ( defined( USE_BAND_915 ) || defined( USE_BAND_915_HYBRID ) )
+    if( ( Radio.CheckRfFrequency( freq ) == true ) &&
+        ( freq >= LORAMAC_FIRST_RX2_CHANNEL ) &&
+        ( freq <= LORAMAC_LAST_RX2_CHANNEL ) &&
+        ( ( ( freq - ( uint32_t ) LORAMAC_FIRST_RX2_CHANNEL ) % ( uint32_t ) LORAMAC_STEPWIDTH_RX2_CHANNEL ) == 0 ) )
+#endif
+    {
+        return true;
+    }
+    return false;
+}
+
 static bool ValidatePayloadLength( uint8_t lenN, int8_t datarate, uint8_t fOptsLen )
 {
     uint16_t maxN = 0;
@@ -2106,7 +2155,7 @@ static bool AdrNextDr( bool adrEnabled, bool updateChannelMask, int8_t* datarate
             }
             if( AdrAckCounter >= ( ADR_ACK_LIMIT + ADR_ACK_DELAY ) )
             {
-                if( ( ( AdrAckCounter - ADR_ACK_DELAY ) % ADR_ACK_LIMIT ) == 0 )
+                if( ( AdrAckCounter % ADR_ACK_DELAY ) == 0 )
                 {
 #if defined( USE_BAND_433 ) || defined( USE_BAND_780 ) || defined( USE_BAND_868 )
                     if( datarate > LORAMAC_TX_MIN_DATARATE )
@@ -2466,7 +2515,7 @@ static void ProcessMacCommands( uint8_t *payload, uint8_t macIndex, uint8_t comm
                     freq |= ( uint32_t )payload[macIndex++] << 16;
                     freq *= 100;
 
-                    if( Radio.CheckRfFrequency( freq ) == false )
+                    if( Rx2FreqInRange( freq ) == false )
                     {
                         status &= 0xFE; // Channel frequency KO
                     }
@@ -2752,23 +2801,23 @@ static int8_t AlternateDatarate( uint16_t nbTrials )
         datarate = DR_1;
     }
 #else
-    if( ( nbTrials % 48 ) != 0 )
+    if( ( nbTrials % 48 ) == 0 )
     {
         datarate = DR_0;
     }
-    else if( ( nbTrials % 32 ) != 0 )
+    else if( ( nbTrials % 32 ) == 0 )
     {
         datarate = DR_1;
     }
-    else if( ( nbTrials % 24 ) != 0 )
+    else if( ( nbTrials % 24 ) == 0 )
     {
         datarate = DR_2;
     }
-    else if( ( nbTrials % 16 ) != 0 )
+    else if( ( nbTrials % 16 ) == 0 )
     {
         datarate = DR_3;
     }
-    else if( ( nbTrials % 8 ) != 0 )
+    else if( ( nbTrials % 8 ) == 0 )
     {
         datarate = DR_4;
     }
@@ -2873,7 +2922,7 @@ LoRaMacStatus_t PrepareFrame( LoRaMacHeader_t *macHdr, LoRaMacFrameCtrl_t *fCtrl
 
                     // Update FCtrl field with new value of OptionsLength
                     LoRaMacBuffer[0x05] = fCtrl->Value;
-                    for( i = 0; i < ( MacCommandsBufferIndex - MacCommandsBufferToRepeatIndex ); i++ )
+                    for( i = 0; i < MacCommandsBufferIndex; i++ )
                     {
                         LoRaMacBuffer[pktHeaderLen++] = MacCommandsBuffer[i];
                     }
